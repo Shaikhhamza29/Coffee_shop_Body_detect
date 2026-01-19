@@ -1,0 +1,15 @@
+# Core
+numpy>=1.26.0
+
+# OpenCV (use headless if running without monitor)
+# opencv-python>=4.8.0
+
+# PyTorch CPU only (Python 3.11 compatible)
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# YOLOv8
+ultralytics>=8.0.0
+
+
