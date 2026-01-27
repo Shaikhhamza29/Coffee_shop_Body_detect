@@ -3,7 +3,7 @@ import time
 from ultralytics import YOLO
 
 # ================= CONFIG =================
-VIDEO_PATH = "CCTV.mp4"
+VIDEO_PATH = "Videos\CCTV.mp4"
 
 DETECT_INTERVAL = 0.5          # seconds
 BOX_THICKNESS = 2
