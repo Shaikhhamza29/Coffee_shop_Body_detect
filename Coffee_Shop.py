@@ -1,140 +1,229 @@
 import cv2
-import time
 from ultralytics import YOLO
 
-# ================= CONFIG =================
-VIDEO_PATH = "Videos\CCTV.mp4"
 
-DETECT_INTERVAL = 0.5          # seconds
-BOX_THICKNESS = 2
-IOU_THRESHOLD = 0.3
+class HumanTracker:
+    """
+    YOLOv8 Human Tracker
+    - Frame-by-frame processing
+    - Stable IDs
+    - Smoothed bounding boxes
+    - Reusable as a package
+    """
 
-YOLO_IMGSZ = 960               # better for far people
-CONF_THRESHOLD = 0.25
+    DEFAULT_IOU_THRESHOLD = 0.5
+    DEFAULT_CONF_THRESHOLD = 0.5
+    DEFAULT_IMGSZ = 832
+    DEFAULT_BOX_THICKNESS = 1
 
-# ================= MODEL =================
-person_model = YOLO("yolov8s.pt")
-print("🔥 YOLO loaded")
+    DETECT_EVERY_N_FRAMES = 7   # set 1 = detect every frame
+    SMOOTH_ALPHA = 0.5
 
-# ================= STATE =================
-next_person_id = 1
-last_detect_time = 0
-persons = {}
+    def __init__(
+        self,
+        model_path="yolov8s.pt",
+        iou_threshold=DEFAULT_IOU_THRESHOLD,
+        conf_threshold=DEFAULT_CONF_THRESHOLD,
+        imgsz=DEFAULT_IMGSZ,
+        box_thickness=DEFAULT_BOX_THICKNESS,
+    ):
+        self.iou_threshold = iou_threshold
+        self.box_thickness = box_thickness
 
-# ================= IOU FUNCTION =================
-def iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
+        self.model = YOLO(model_path)
+        self.imgsz = imgsz
+        self.conf = conf_threshold
 
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        self.tracks = {}          # raw detections
+        self.smoothed = {}        # smoothed boxes
+        self.cached_persons = {}  # public output
 
-    union = areaA + areaB - inter
-    return inter / union if union > 0 else 0
+        self.next_id = 1
+        self.frame_count = 0
 
-print("🔥 Body Tracking Started")
+        print("🔥 HumanTracker initialized (FRAME-BY-FRAME MODE)")
 
-# ================= MAIN LOOP =================
-cap = cv2.VideoCapture(VIDEO_PATH)
-if not cap.isOpened():
-    print("❌ ERROR: Video not opened")
-    exit()
+    # ---------- IOU ----------
+    @staticmethod
+    def _iou(a, b):
+        ax2, ay2 = a["x1"] + a["w"], a["y1"] + a["h"]
+        bx2, by2 = b["x1"] + b["w"], b["y1"] + b["h"]
 
-# ---------- FPS SYNC ----------
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps <= 0:
-    fps = 25
-frame_delay = int(1000 / fps)
-print(f"📽 Video FPS: {fps}")
+        xA = max(a["x1"], b["x1"])
+        yA = max(a["y1"], b["y1"])
+        xB = min(ax2, bx2)
+        yB = min(ay2, by2)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        continue
+        inter = max(0, xB - xA) * max(0, yB - yA)
+        union = (a["w"] * a["h"]) + (b["w"] * b["h"]) - inter
+        return inter / union if union > 0 else 0
 
-    now = time.time()
-
-    # ================= DETECTION =================
-    if now - last_detect_time >= DETECT_INTERVAL:
-        results = person_model(
+    # ---------- DETECT ----------
+    def _detect(self, frame):
+        results = self.model(
             frame,
-            imgsz=YOLO_IMGSZ,
-            conf=CONF_THRESHOLD,
-            classes=[0],
+            imgsz=self.imgsz,
+            conf=self.conf,
+            classes=[0],  # person
             verbose=False
         )
 
-        active_ids = set()
-
+        detections = []
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                bbox = (x1, y1, x2, y2)
+                detections.append({
+                    "x1": x1,
+                    "y1": y1,
+                    "w": x2 - x1,
+                    "h": y2 - y1
+                })
+        return detections
 
-                best_id = None
-                best_score = 0.0
+    # ---------- TRACK UPDATE ----------
+    def _update(self, detections):
+        active = set()
 
-                for pid, pdata in persons.items():
-                    score = iou(bbox, pdata["bbox"])
-                    if score > best_score:
-                        best_score = score
-                        best_id = pid
+        for det in detections:
+            best_id = None
+            best_score = 0
 
-                if best_id is None or best_score < IOU_THRESHOLD:
-                    pid = next_person_id
-                    next_person_id += 1
-                    persons[pid] = {"bbox": bbox}
-                    print(f"➡️ ID {pid} ENTERED | TL=({x1},{y1}) BR=({x2},{y2})")
-                else:
-                    pid = best_id
-                    persons[pid]["bbox"] = bbox
+            for pid, track in self.tracks.items():
+                score = self._iou(det, track)
+                if score > best_score:
+                    best_score = score
+                    best_id = pid
 
-                active_ids.add(pid)
+            if best_id is None or best_score < self.iou_threshold:
+                pid = self.next_id
+                self.next_id += 1
+                self.tracks[pid] = det
+                self.smoothed[pid] = det.copy()
+            else:
+                pid = best_id
+                self.tracks[pid] = det
 
-        # Remove disappeared persons
-        for pid in list(persons.keys()):
-            if pid not in active_ids:
-                del persons[pid]
+            active.add(pid)
 
-        last_detect_time = now
+        self.tracks = {pid: t for pid, t in self.tracks.items() if pid in active}
+        self.smoothed = {pid: s for pid, s in self.smoothed.items() if pid in active}
 
-    # ================= DRAW =================
-    for pid, pdata in persons.items():
-        x1, y1, x2, y2 = pdata["bbox"]
-        w = x2 - x1
-        h = y2 - y1
+    # ---------- SMOOTH ----------
+    def _smooth(self):
+        if not self.tracks:
+            self.cached_persons = {}
+            return
 
-        # ---- PRINT FULL COORDINATES ----
-        print(f"ID {pid} | TL=({x1},{y1}) BR=({x2},{y2}) W={w} H={h}")
+        a = self.SMOOTH_ALPHA
+        for pid, target in self.tracks.items():
+            s = self.smoothed.get(pid, target.copy())
 
-        # ---- DRAW BOX ----
-        cv2.rectangle(frame, (x1, y1), (x2, y2),
-                      (0, 255, 0), BOX_THICKNESS)
+            s["x1"] += int(a * (target["x1"] - s["x1"]))
+            s["y1"] += int(a * (target["y1"] - s["y1"]))
+            s["w"]  += int(a * (target["w"]  - s["w"]))
+            s["h"]  += int(a * (target["h"]  - s["h"]))
 
-        # ---- DRAW TEXT ----
-        cv2.putText(frame, f"ID {pid}",
-                    (x1, y1 - 45),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 0), 2)
+            self.smoothed[pid] = s
 
-        cv2.putText(frame, f"TL({x1},{y1}) BR({x2},{y2})",
-                    (x1, y1 - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (0, 255, 255), 1)
+        self.cached_persons = {
+            pid: {
+                "x1": s["x1"],
+                "y1": s["y1"],
+                "w": s["w"],
+                "h": s["h"],
+                "x2": s["x1"] + s["w"],
+                "y2": s["y1"] + s["h"]
+            }
+            for pid, s in self.smoothed.items()
+        }
 
-        cv2.putText(frame, f"W:{w} H:{h}",
-                    (x1, y1 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (255, 255, 0), 1)
+    # ---------- MAIN API ----------
+    def process_frame(self, frame):
+        """
+        Pass ONE frame → get people data
+        """
+        self.frame_count += 1
 
-    cv2.imshow("Human Tracking - CCTV", frame)
+        if self.frame_count % self.DETECT_EVERY_N_FRAMES == 0:
+            detections = self._detect(frame)
+            self._update(detections)
 
-    if cv2.waitKey(frame_delay) & 0xFF == ord("q"):
-        break
+        self._smooth()
+        return self.cached_persons.copy()
 
-cap.release()
-cv2.destroyAllWindows()
+    # ---------- OPTIONAL DRAW ----------
+    def draw(self, frame):
+        # ---- PEOPLE COUNT ON SCREEN ----
+        cv2.putText(
+            frame,
+            f"People: {len(self.cached_persons)}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            2
+        )
+
+        # ---- DRAW EACH PERSON ----
+        for pid, p in self.cached_persons.items():
+            x1, y1 = p["x1"], p["y1"]
+            w, h = p["w"], p["h"]
+            x2, y2 = p["x2"], p["y2"]
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                self.box_thickness
+            )
+
+            # ID
+            cv2.putText(
+                frame,
+                f"ID {pid}",
+                (x1, y1 - 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
+            # Coordinates x1, y1
+            cv2.putText(
+                frame,
+                f"x1:{x1} y1:{y1}",
+                (x1, y1 - 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 0),
+                1
+            )
+
+            # Width, Height
+            cv2.putText(
+                frame,
+                f"w:{w} h:{h}",
+                (x1, y2 + 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1
+            )
+
+
+    # ---------- SINGLE CALL API ----------
+    def analyze_frame(self, frame, draw=True):
+        """
+        ONE function call.
+        Pass frame → get people count + bounding boxes.
+        """
+        persons = self.process_frame(frame)
+
+        if draw:
+            self.draw(frame)
+
+        return {
+            "count": len(persons),
+            "persons": persons
+        }
